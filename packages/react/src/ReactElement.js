@@ -146,6 +146,7 @@ function warnIfStringRefCannotBeAutoConverted(config) {
 const ReactElement = function(type, key, ref, self, source, owner, props) {
   const element = {
     // This tag allows us to uniquely identify this as a React Element
+    // $$typeof === REACT_ELEMENT_TYPE的非null对象就是一个合法的React Element
     $$typeof: REACT_ELEMENT_TYPE,
 
     // Built-in properties that belong on the element
@@ -195,7 +196,7 @@ const ReactElement = function(type, key, ref, self, source, owner, props) {
       Object.freeze(element);
     }
   }
-
+  // 返回的是一个对象
   return element;
 };
 
@@ -345,6 +346,7 @@ export function jsxDEV(type, config, maybeKey, source, self) {
  * Create and return a new ReactElement of the given type.
  * See https://reactjs.org/docs/react-api.html#createelement
  */
+// 每一个jsx节点会被babel编译为React.createElement函数
 export function createElement(type, config, children) {
   let propName;
 
@@ -356,6 +358,7 @@ export function createElement(type, config, children) {
   let self = null;
   let source = null;
 
+  // 将config处理后赋值给props
   if (config != null) {
     if (hasValidRef(config)) {
       ref = config.ref;
@@ -386,7 +389,7 @@ export function createElement(type, config, children) {
   const childrenLength = arguments.length - 2;
   if (childrenLength === 1) {
     props.children = children;
-  } else if (childrenLength > 1) {
+  } else if (childrenLength > 1) { // 如果arguments的长度大于3，说明有多个child
     const childArray = Array(childrenLength);
     for (let i = 0; i < childrenLength; i++) {
       childArray[i] = arguments[i + 2];
@@ -396,7 +399,7 @@ export function createElement(type, config, children) {
         Object.freeze(childArray);
       }
     }
-    props.children = childArray;
+    props.children = childArray; // 将子节点保存在props的children中
   }
 
   // Resolve default props
@@ -422,6 +425,7 @@ export function createElement(type, config, children) {
       }
     }
   }
+  // 调用这个工厂函数返回一个ReactElement
   return ReactElement(
     type,
     key,
@@ -538,7 +542,7 @@ export function cloneElement(element, config, children) {
 }
 
 /**
- * Verifies the object is a ReactElement.
+ * Verifies the object is a ReactElement. 用于判断一个对象是否为react element
  * See https://reactjs.org/docs/react-api.html#isvalidelement
  * @param {?object} object
  * @return {boolean} True if `object` is a ReactElement.

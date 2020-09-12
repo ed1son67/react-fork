@@ -17,16 +17,20 @@ if (__DEV__) {
 /**
  * Base class helpers for the updating state of a component.
  */
+/*
+class App extends React.Component {
+}
+*/
 function Component(props, context, updater) {
   this.props = props;
   this.context = context;
   // If a component has string refs, we will assign a different object later.
   this.refs = emptyObject;
   // We initialize the default updater but the real one gets injected by the
-  // renderer.
+  // renderer，不同平台有不同renderer，但他们要实现同样的api，也就ReactNoopUpdateQueue的定义
   this.updater = updater || ReactNoopUpdateQueue;
 }
-
+// 用于判断是classComponent还是functionComponent，因为instanceof都等于Function
 Component.prototype.isReactComponent = {};
 
 /**
@@ -62,6 +66,7 @@ Component.prototype.setState = function(partialState, callback) {
     'setState(...): takes an object of state variables to update or a ' +
       'function which returns an object of state variables.',
   );
+  // setState只是简单做了一些判断工作，然后推进更新队列里面
   this.updater.enqueueSetState(this, partialState, callback, 'setState');
 };
 
@@ -125,7 +130,9 @@ ComponentDummy.prototype = Component.prototype;
 
 /**
  * Convenience component with default shallow equality check for sCU.
+ * PureComponent在scu中实现了浅对比
  */
+// 这里和Component的定义是一样的，不同的地方在prototype
 function PureComponent(props, context, updater) {
   this.props = props;
   this.context = context;

@@ -214,12 +214,12 @@ const createFiber = function(
   // $FlowFixMe: the shapes are exact here but Flow doesn't like constructors
   return new FiberNode(tag, pendingProps, key, mode);
 };
-
+// 判断是否为compositeComponent
 function shouldConstruct(Component: Function) {
   const prototype = Component.prototype;
   return !!(prototype && prototype.isReactComponent);
 }
-
+// 判断是否为函数组件
 export function isSimpleFunctionComponent(type: any) {
   return (
     typeof type === 'function' &&
@@ -248,6 +248,7 @@ export function resolveLazyComponentTag(Component: Function): WorkTag {
   return IndeterminateComponent;
 }
 
+// 创建wip fiber
 // This is used to create an alternate fiber to do work on.
 export function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
   let workInProgress = current.alternate;
@@ -421,7 +422,7 @@ export function resetWorkInProgress(workInProgress: Fiber, renderLanes: Lanes) {
 
   return workInProgress;
 }
-
+// 创建fiber根节点
 export function createHostRootFiber(tag: RootTag): Fiber {
   let mode;
   if (tag === ConcurrentRoot) {
