@@ -103,8 +103,10 @@ function mapIntoArray(
     }
   }
 
+  // 用invokeCallback判断children的类型，如果可以渲染就调用callback
   if (invokeCallback) {
     const child = children;
+    // 对child执行了map函数
     let mappedChild = callback(child);
     // If it's the only child, treat the name as if it was wrapped in an array
     // so that it's consistent if the number of children grows:
@@ -115,6 +117,7 @@ function mapIntoArray(
       if (childKey != null) {
         escapedChildKey = escapeUserProvidedKey(childKey) + '/';
       }
+      // 递归调用，拍平数组
       mapIntoArray(mappedChild, array, escapedChildKey, '', c => c);
     } else if (mappedChild != null) {
       if (isValidElement(mappedChild)) {
