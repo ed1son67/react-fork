@@ -17,13 +17,10 @@ import type {
 } from './ReactFiberHostConfig';
 import type {Fiber} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
-import type {Lanes} from './ReactFiberLane';
+import type {Lanes} from './ReactFiberLane.new';
 import type {SuspenseState} from './ReactFiberSuspenseComponent.new';
 import type {UpdateQueue} from './ReactUpdateQueue.new';
-import type {
-  Effect as HookEffect,
-  FunctionComponentUpdateQueue,
-} from './ReactFiberHooks.new';
+import type {FunctionComponentUpdateQueue} from './ReactFiberHooks.new';
 import type {Wakeable} from 'shared/ReactTypes';
 import type {ReactPriorityLevel} from './ReactInternalTypes';
 import type {OffscreenState} from './ReactFiberOffscreenComponent';
@@ -34,6 +31,7 @@ import {
   enableSchedulerTracing,
   enableProfilerTimer,
   enableProfilerCommitHooks,
+  enableProfilerNestedUpdatePhase,
   enableSuspenseServerRenderer,
   enableFundamentalAPI,
   enableSuspenseCallback,
@@ -56,7 +54,6 @@ import {
   SuspenseListComponent,
   FundamentalComponent,
   ScopeComponent,
-  Block,
   OffscreenComponent,
   LegacyHiddenComponent,
 } from './ReactWorkTags';
@@ -69,16 +66,24 @@ import {
   NoFlags,
   ContentReset,
   Placement,
+  ChildDeletion,
   Snapshot,
   Update,
+  Passive,
   PassiveMask,
+  PassiveUnmountPendingDev,
 } from './ReactFiberFlags';
 import getComponentName from 'shared/getComponentName';
 import invariant from 'shared/invariant';
+import {
+  resetCurrentFiber as resetCurrentDebugFiberInDEV,
+  setCurrentFiber as setCurrentDebugFiberInDEV,
+} from './ReactCurrentFiber';
 
 import {onCommitUnmount} from './ReactFiberDevToolsHook.new';
 import {resolveDefaultProps} from './ReactFiberLazyComponent.new';
 import {
+  isCurrentUpdateNested,
   getCommitTime,
   recordLayoutEffectDuration,
   startLayoutEffectTimer,
@@ -121,8 +126,9 @@ import {
   captureCommitPhaseError,
   resolveRetryWakeable,
   markCommitTimeOfFallback,
+  enqueuePendingPassiveHookEffectMount,
+  enqueuePendingPassiveHookEffectUnmount,
   enqueuePendingPassiveProfilerEffect,
-  schedulePassiveEffectCallback,
 } from './ReactFiberWorkLoop.new';
 import {
   NoFlags as NoHookEffect,
@@ -138,6 +144,8 @@ if (__DEV__) {
 }
 
 const PossiblyWeakSet = typeof WeakSet === 'function' ? WeakSet : Set;
+
+let nextEffect: Fiber | null = null;
 
 const callComponentWillUnmountWithTimer = function(current, instance) {
   instance.props = current.memoizedProps;
@@ -159,11 +167,7 @@ const callComponentWillUnmountWithTimer = function(current, instance) {
 };
 
 // Capture errors so they don't interrupt unmounting.
-function safelyCallComponentWillUnmount(
-  current: Fiber,
-  instance: any,
-  nearestMountedAncestor: Fiber,
-) {
+function safelyCallComponentWillUnmount(current: Fiber, instance: any) {
   if (__DEV__) {
     invokeGuardedCallback(
       null,
@@ -174,32 +178,56 @@ function safelyCallComponentWillUnmount(
     );
     if (hasCaughtError()) {
       const unmountError = clearCaughtError();
-      captureCommitPhaseError(current, nearestMountedAncestor, unmountError);
+      captureCommitPhaseError(current, unmountError);
     }
   } else {
     try {
       callComponentWillUnmountWithTimer(current, instance);
     } catch (unmountError) {
-      captureCommitPhaseError(current, nearestMountedAncestor, unmountError);
+      captureCommitPhaseError(current, unmountError);
     }
   }
 }
 
-function safelyDetachRef(current: Fiber, nearestMountedAncestor: Fiber) {
+function safelyDetachRef(current: Fiber) {
   const ref = current.ref;
   if (ref !== null) {
     if (typeof ref === 'function') {
       if (__DEV__) {
-        invokeGuardedCallback(null, ref, null, null);
+        if (
+          enableProfilerTimer &&
+          enableProfilerCommitHooks &&
+          current.mode & ProfileMode
+        ) {
+          startLayoutEffectTimer();
+          invokeGuardedCallback(null, ref, null, null);
+          recordLayoutEffectDuration(current);
+        } else {
+          invokeGuardedCallback(null, ref, null, null);
+        }
+
         if (hasCaughtError()) {
           const refError = clearCaughtError();
-          captureCommitPhaseError(current, nearestMountedAncestor, refError);
+          captureCommitPhaseError(current, refError);
         }
       } else {
         try {
-          ref(null);
+          if (
+            enableProfilerTimer &&
+            enableProfilerCommitHooks &&
+            current.mode & ProfileMode
+          ) {
+            try {
+              startLayoutEffectTimer();
+              ref(null);
+            } finally {
+              recordLayoutEffectDuration(current);
+            }
+          } else {
+            ref(null);
+          }
         } catch (refError) {
-          captureCommitPhaseError(current, nearestMountedAncestor, refError);
+          captureCommitPhaseError(current, refError);
         }
       }
     } else {
@@ -208,22 +236,18 @@ function safelyDetachRef(current: Fiber, nearestMountedAncestor: Fiber) {
   }
 }
 
-export function safelyCallDestroy(
-  current: Fiber,
-  nearestMountedAncestor: Fiber | null,
-  destroy: () => void,
-) {
+function safelyCallDestroy(current: Fiber, destroy: () => void) {
   if (__DEV__) {
     invokeGuardedCallback(null, destroy, null);
     if (hasCaughtError()) {
       const error = clearCaughtError();
-      captureCommitPhaseError(current, nearestMountedAncestor, error);
+      captureCommitPhaseError(current, error);
     }
   } else {
     try {
       destroy();
     } catch (error) {
-      captureCommitPhaseError(current, nearestMountedAncestor, error);
+      captureCommitPhaseError(current, error);
     }
   }
 }
@@ -235,8 +259,7 @@ function commitBeforeMutationLifeCycles(
   switch (finishedWork.tag) {
     case FunctionComponent:
     case ForwardRef:
-    case SimpleMemoComponent:
-    case Block: {
+    case SimpleMemoComponent: {
       return;
     }
     case ClassComponent: {
@@ -320,23 +343,19 @@ function commitBeforeMutationLifeCycles(
   );
 }
 
-function commitHookEffectListUnmount(
-  tag: HookFlags,
-  finishedWork: Fiber,
-  nearestMountedAncestor: Fiber | null,
-) {
+function commitHookEffectListUnmount(flags: HookFlags, finishedWork: Fiber) {
   const updateQueue: FunctionComponentUpdateQueue | null = (finishedWork.updateQueue: any);
   const lastEffect = updateQueue !== null ? updateQueue.lastEffect : null;
   if (lastEffect !== null) {
     const firstEffect = lastEffect.next;
     let effect = firstEffect;
     do {
-      if ((effect.tag & tag) === tag) {
+      if ((effect.tag & flags) === flags) {
         // Unmount
         const destroy = effect.destroy;
         effect.destroy = undefined;
         if (destroy !== undefined) {
-          safelyCallDestroy(finishedWork, nearestMountedAncestor, destroy);
+          safelyCallDestroy(finishedWork, destroy);
         }
       }
       effect = effect.next;
@@ -344,43 +363,7 @@ function commitHookEffectListUnmount(
   }
 }
 
-// TODO: Remove this duplication.
-function commitHookEffectListUnmount2(
-  // Tags to check for when deciding whether to unmount. e.g. to skip over layout effects
-  hookFlags: HookFlags,
-  fiber: Fiber,
-  nearestMountedAncestor: Fiber | null,
-): void {
-  const updateQueue: FunctionComponentUpdateQueue | null = (fiber.updateQueue: any);
-  const lastEffect = updateQueue !== null ? updateQueue.lastEffect : null;
-  if (lastEffect !== null) {
-    const firstEffect = lastEffect.next;
-    let effect = firstEffect;
-    do {
-      const {next, tag} = effect;
-      if ((tag & hookFlags) === hookFlags) {
-        const destroy = effect.destroy;
-        if (destroy !== undefined) {
-          effect.destroy = undefined;
-          if (
-            enableProfilerTimer &&
-            enableProfilerCommitHooks &&
-            fiber.mode & ProfileMode
-          ) {
-            startPassiveEffectTimer();
-            safelyCallDestroy(fiber, nearestMountedAncestor, destroy);
-            recordPassiveEffectDuration(fiber);
-          } else {
-            safelyCallDestroy(fiber, nearestMountedAncestor, destroy);
-          }
-        }
-      }
-      effect = next;
-    } while (effect !== firstEffect);
-  }
-}
-
-function commitHookEffectListMount(tag: HookFlags, finishedWork: Fiber) {
+function commitHookEffectListMount(tag: number, finishedWork: Fiber) {
   const updateQueue: FunctionComponentUpdateQueue | null = (finishedWork.updateQueue: any);
   const lastEffect = updateQueue !== null ? updateQueue.lastEffect : null;
   if (lastEffect !== null) {
@@ -430,78 +413,21 @@ function commitHookEffectListMount(tag: HookFlags, finishedWork: Fiber) {
   }
 }
 
-function invokePassiveEffectCreate(effect: HookEffect): void {
-  const create = effect.create;
-  effect.destroy = create();
-}
-
-// TODO: Remove this duplication.
-function commitHookEffectListMount2(fiber: Fiber): void {
-  const updateQueue: FunctionComponentUpdateQueue | null = (fiber.updateQueue: any);
+function schedulePassiveEffects(finishedWork: Fiber) {
+  const updateQueue: FunctionComponentUpdateQueue | null = (finishedWork.updateQueue: any);
   const lastEffect = updateQueue !== null ? updateQueue.lastEffect : null;
   if (lastEffect !== null) {
     const firstEffect = lastEffect.next;
     let effect = firstEffect;
     do {
       const {next, tag} = effect;
-
       if (
         (tag & HookPassive) !== NoHookEffect &&
         (tag & HookHasEffect) !== NoHookEffect
       ) {
-        if (__DEV__) {
-          if (
-            enableProfilerTimer &&
-            enableProfilerCommitHooks &&
-            fiber.mode & ProfileMode
-          ) {
-            startPassiveEffectTimer();
-            invokeGuardedCallback(
-              null,
-              invokePassiveEffectCreate,
-              null,
-              effect,
-            );
-            recordPassiveEffectDuration(fiber);
-          } else {
-            invokeGuardedCallback(
-              null,
-              invokePassiveEffectCreate,
-              null,
-              effect,
-            );
-          }
-          if (hasCaughtError()) {
-            invariant(fiber !== null, 'Should be working on an effect.');
-            const error = clearCaughtError();
-            captureCommitPhaseError(fiber, fiber.return, error);
-          }
-        } else {
-          try {
-            const create = effect.create;
-            if (
-              enableProfilerTimer &&
-              enableProfilerCommitHooks &&
-              fiber.mode & ProfileMode
-            ) {
-              try {
-                startPassiveEffectTimer();
-                effect.destroy = create();
-              } finally {
-                recordPassiveEffectDuration(fiber);
-              }
-            } else {
-              effect.destroy = create();
-            }
-            // TODO: This is missing the warning that exists in commitHookEffectListMount.
-            // The warning refers to useEffect but only applies to useLayoutEffect.
-          } catch (error) {
-            invariant(fiber !== null, 'Should be working on an effect.');
-            captureCommitPhaseError(fiber, fiber.return, error);
-          }
-        }
+        enqueuePendingPassiveHookEffectUnmount(finishedWork, effect);
+        enqueuePendingPassiveHookEffectMount(finishedWork, effect);
       }
-
       effect = next;
     } while (effect !== firstEffect);
   }
@@ -523,22 +449,24 @@ export function commitPassiveEffectDurations(
           // It does not get reset until the start of the next commit phase.
           const commitTime = getCommitTime();
 
+          let phase = finishedWork.alternate === null ? 'mount' : 'update';
+          if (enableProfilerNestedUpdatePhase) {
+            if (isCurrentUpdateNested()) {
+              phase = 'nested-update';
+            }
+          }
+
           if (typeof onPostCommit === 'function') {
             if (enableSchedulerTracing) {
               onPostCommit(
                 id,
-                finishedWork.alternate === null ? 'mount' : 'update',
+                phase,
                 passiveEffectDuration,
                 commitTime,
                 finishedRoot.memoizedInteractions,
               );
             } else {
-              onPostCommit(
-                id,
-                finishedWork.alternate === null ? 'mount' : 'update',
-                passiveEffectDuration,
-                commitTime,
-              );
+              onPostCommit(id, phase, passiveEffectDuration, commitTime);
             }
           }
 
@@ -571,8 +499,7 @@ function commitLifeCycles(
   switch (finishedWork.tag) {
     case FunctionComponent:
     case ForwardRef:
-    case SimpleMemoComponent:
-    case Block: {
+    case SimpleMemoComponent: {
       // At this point layout effects have already been destroyed (during mutation phase).
       // This is done to prevent sibling component effects from interfering with each other,
       // e.g. a destroy function in one component should never override a ref set
@@ -592,9 +519,7 @@ function commitLifeCycles(
         commitHookEffectListMount(HookLayout | HookHasEffect, finishedWork);
       }
 
-      if ((finishedWork.subtreeFlags & PassiveMask) !== NoFlags) {
-        schedulePassiveEffectCallback();
-      }
+      schedulePassiveEffects(finishedWork);
       return;
     }
     case ClassComponent: {
@@ -798,11 +723,18 @@ function commitLifeCycles(
 
         const commitTime = getCommitTime();
 
+        let phase = current === null ? 'mount' : 'update';
+        if (enableProfilerNestedUpdatePhase) {
+          if (isCurrentUpdateNested()) {
+            phase = 'nested-update';
+          }
+        }
+
         if (typeof onRender === 'function') {
           if (enableSchedulerTracing) {
             onRender(
               finishedWork.memoizedProps.id,
-              current === null ? 'mount' : 'update',
+              phase,
               finishedWork.actualDuration,
               finishedWork.treeBaseDuration,
               finishedWork.actualStartTime,
@@ -812,7 +744,7 @@ function commitLifeCycles(
           } else {
             onRender(
               finishedWork.memoizedProps.id,
-              current === null ? 'mount' : 'update',
+              phase,
               finishedWork.actualDuration,
               finishedWork.treeBaseDuration,
               finishedWork.actualStartTime,
@@ -826,7 +758,7 @@ function commitLifeCycles(
             if (enableSchedulerTracing) {
               onCommit(
                 finishedWork.memoizedProps.id,
-                current === null ? 'mount' : 'update',
+                phase,
                 effectDuration,
                 commitTime,
                 finishedRoot.memoizedInteractions,
@@ -834,7 +766,7 @@ function commitLifeCycles(
             } else {
               onCommit(
                 finishedWork.memoizedProps.id,
-                current === null ? 'mount' : 'update',
+                phase,
                 effectDuration,
                 commitTime,
               );
@@ -945,7 +877,20 @@ function commitAttachRef(finishedWork: Fiber) {
       instanceToUse = instance;
     }
     if (typeof ref === 'function') {
-      ref(instanceToUse);
+      if (
+        enableProfilerTimer &&
+        enableProfilerCommitHooks &&
+        finishedWork.mode & ProfileMode
+      ) {
+        try {
+          startLayoutEffectTimer();
+          ref(instanceToUse);
+        } finally {
+          recordLayoutEffectDuration(finishedWork);
+        }
+      } else {
+        ref(instanceToUse);
+      }
     } else {
       if (__DEV__) {
         if (!ref.hasOwnProperty('current')) {
@@ -966,7 +911,20 @@ function commitDetachRef(current: Fiber) {
   const currentRef = current.ref;
   if (currentRef !== null) {
     if (typeof currentRef === 'function') {
-      currentRef(null);
+      if (
+        enableProfilerTimer &&
+        enableProfilerCommitHooks &&
+        current.mode & ProfileMode
+      ) {
+        try {
+          startLayoutEffectTimer();
+          currentRef(null);
+        } finally {
+          recordLayoutEffectDuration(current);
+        }
+      } else {
+        currentRef(null);
+      }
     } else {
       currentRef.current = null;
     }
@@ -979,7 +937,6 @@ function commitDetachRef(current: Fiber) {
 function commitUnmount(
   finishedRoot: FiberRoot,
   current: Fiber,
-  nearestMountedAncestor: Fiber,
   renderPriorityLevel: ReactPriorityLevel,
 ): void {
   onCommitUnmount(current);
@@ -988,8 +945,7 @@ function commitUnmount(
     case FunctionComponent:
     case ForwardRef:
     case MemoComponent:
-    case SimpleMemoComponent:
-    case Block: {
+    case SimpleMemoComponent: {
       const updateQueue: FunctionComponentUpdateQueue | null = (current.updateQueue: any);
       if (updateQueue !== null) {
         const lastEffect = updateQueue.lastEffect;
@@ -1000,17 +956,19 @@ function commitUnmount(
           do {
             const {destroy, tag} = effect;
             if (destroy !== undefined) {
-              if ((tag & HookLayout) !== NoHookEffect) {
+              if ((tag & HookPassive) !== NoHookEffect) {
+                enqueuePendingPassiveHookEffectUnmount(current, effect);
+              } else {
                 if (
                   enableProfilerTimer &&
                   enableProfilerCommitHooks &&
                   current.mode & ProfileMode
                 ) {
                   startLayoutEffectTimer();
-                  safelyCallDestroy(current, nearestMountedAncestor, destroy);
+                  safelyCallDestroy(current, destroy);
                   recordLayoutEffectDuration(current);
                 } else {
-                  safelyCallDestroy(current, nearestMountedAncestor, destroy);
+                  safelyCallDestroy(current, destroy);
                 }
               }
             }
@@ -1021,19 +979,15 @@ function commitUnmount(
       return;
     }
     case ClassComponent: {
-      safelyDetachRef(current, nearestMountedAncestor);
+      safelyDetachRef(current);
       const instance = current.stateNode;
       if (typeof instance.componentWillUnmount === 'function') {
-        safelyCallComponentWillUnmount(
-          current,
-          instance,
-          nearestMountedAncestor,
-        );
+        safelyCallComponentWillUnmount(current, instance);
       }
       return;
     }
     case HostComponent: {
-      safelyDetachRef(current, nearestMountedAncestor);
+      safelyDetachRef(current);
       return;
     }
     case HostPortal: {
@@ -1041,12 +995,7 @@ function commitUnmount(
       // We are also not using this parent because
       // the portal will get pushed immediately.
       if (supportsMutation) {
-        unmountHostComponents(
-          finishedRoot,
-          current,
-          nearestMountedAncestor,
-          renderPriorityLevel,
-        );
+        unmountHostComponents(finishedRoot, current, renderPriorityLevel);
       } else if (supportsPersistence) {
         emptyPortalContainer(current);
       }
@@ -1076,7 +1025,7 @@ function commitUnmount(
     }
     case ScopeComponent: {
       if (enableScopeAPI) {
-        safelyDetachRef(current, nearestMountedAncestor);
+        safelyDetachRef(current);
       }
       return;
     }
@@ -1086,7 +1035,6 @@ function commitUnmount(
 function commitNestedUnmounts(
   finishedRoot: FiberRoot,
   root: Fiber,
-  nearestMountedAncestor: Fiber,
   renderPriorityLevel: ReactPriorityLevel,
 ): void {
   // While we're inside a removed host node we don't want to call
@@ -1096,12 +1044,7 @@ function commitNestedUnmounts(
   // we do an inner loop while we're still inside the host node.
   let node: Fiber = root;
   while (true) {
-    commitUnmount(
-      finishedRoot,
-      node,
-      nearestMountedAncestor,
-      renderPriorityLevel,
-    );
+    commitUnmount(finishedRoot, node, renderPriorityLevel);
     // Visit children because they may contain more composite or host nodes.
     // Skip portals because commitUnmount() currently visits them recursively.
     if (
@@ -1147,6 +1090,27 @@ function detachFiberMutation(fiber: Fiber) {
     fiber.alternate = null;
   }
   fiber.return = null;
+}
+
+export function detachFiberAfterEffects(fiber: Fiber): void {
+  // Null out fields to improve GC for references that may be lingering (e.g. DevTools).
+  // Note that we already cleared the return pointer in detachFiberMutation().
+  fiber.child = null;
+  fiber.deletions = null;
+  fiber.dependencies = null;
+  fiber.memoizedProps = null;
+  fiber.memoizedState = null;
+  fiber.pendingProps = null;
+  fiber.sibling = null;
+  fiber.stateNode = null;
+  fiber.updateQueue = null;
+  fiber.nextEffect = null;
+  fiber.firstEffect = null;
+  fiber.lastEffect = null;
+
+  if (__DEV__) {
+    fiber._debugOwner = null;
+  }
 }
 
 function emptyPortalContainer(current: Fiber) {
@@ -1384,7 +1348,6 @@ function insertOrAppendPlacementNode(
 function unmountHostComponents(
   finishedRoot: FiberRoot,
   current: Fiber,
-  nearestMountedAncestor: Fiber,
   renderPriorityLevel: ReactPriorityLevel,
 ): void {
   // We only have the top Fiber that was deleted but we need to recurse down its
@@ -1434,12 +1397,7 @@ function unmountHostComponents(
     }
 
     if (node.tag === HostComponent || node.tag === HostText) {
-      commitNestedUnmounts(
-        finishedRoot,
-        node,
-        nearestMountedAncestor,
-        renderPriorityLevel,
-      );
+      commitNestedUnmounts(finishedRoot, node, renderPriorityLevel);
       // After all the children have unmounted, it is now safe to remove the
       // node from the tree.
       if (currentParentIsContainer) {
@@ -1456,12 +1414,7 @@ function unmountHostComponents(
       // Don't visit children because we already visited them.
     } else if (enableFundamentalAPI && node.tag === FundamentalComponent) {
       const fundamentalNode = node.stateNode.instance;
-      commitNestedUnmounts(
-        finishedRoot,
-        node,
-        nearestMountedAncestor,
-        renderPriorityLevel,
-      );
+      commitNestedUnmounts(finishedRoot, node, renderPriorityLevel);
       // After all the children have unmounted, it is now safe to remove the
       // node from the tree.
       if (currentParentIsContainer) {
@@ -1513,12 +1466,7 @@ function unmountHostComponents(
         continue;
       }
     } else {
-      commitUnmount(
-        finishedRoot,
-        node,
-        nearestMountedAncestor,
-        renderPriorityLevel,
-      );
+      commitUnmount(finishedRoot, node, renderPriorityLevel);
       // Visit children because we may find more host components below.
       if (node.child !== null) {
         node.child.return = node;
@@ -1548,26 +1496,15 @@ function unmountHostComponents(
 function commitDeletion(
   finishedRoot: FiberRoot,
   current: Fiber,
-  nearestMountedAncestor: Fiber,
   renderPriorityLevel: ReactPriorityLevel,
 ): void {
   if (supportsMutation) {
     // Recursively delete all host nodes from the parent.
     // Detach refs and call componentWillUnmount() on the whole subtree.
-    unmountHostComponents(
-      finishedRoot,
-      current,
-      nearestMountedAncestor,
-      renderPriorityLevel,
-    );
+    unmountHostComponents(finishedRoot, current, renderPriorityLevel);
   } else {
     // Detach refs and call componentWillUnmount() on the whole subtree.
-    commitNestedUnmounts(
-      finishedRoot,
-      current,
-      nearestMountedAncestor,
-      renderPriorityLevel,
-    );
+    commitNestedUnmounts(finishedRoot, current, renderPriorityLevel);
   }
   const alternate = current.alternate;
   detachFiberMutation(current);
@@ -1582,8 +1519,7 @@ function commitWork(current: Fiber | null, finishedWork: Fiber): void {
       case FunctionComponent:
       case ForwardRef:
       case MemoComponent:
-      case SimpleMemoComponent:
-      case Block: {
+      case SimpleMemoComponent: {
         // Layout effects are destroyed during the mutation phase so that all
         // destroy functions for all fibers are called before any create functions.
         // This prevents sibling component effects from interfering with each other,
@@ -1599,17 +1535,12 @@ function commitWork(current: Fiber | null, finishedWork: Fiber): void {
             commitHookEffectListUnmount(
               HookLayout | HookHasEffect,
               finishedWork,
-              finishedWork.return,
             );
           } finally {
             recordLayoutEffectDuration(finishedWork);
           }
         } else {
-          commitHookEffectListUnmount(
-            HookLayout | HookHasEffect,
-            finishedWork,
-            finishedWork.return,
-          );
+          commitHookEffectListUnmount(HookLayout | HookHasEffect, finishedWork);
         }
         return;
       }
@@ -1650,8 +1581,7 @@ function commitWork(current: Fiber | null, finishedWork: Fiber): void {
     case FunctionComponent:
     case ForwardRef:
     case MemoComponent:
-    case SimpleMemoComponent:
-    case Block: {
+    case SimpleMemoComponent: {
       // Layout effects are destroyed during the mutation phase so that all
       // destroy functions for all fibers are called before any create functions.
       // This prevents sibling component effects from interfering with each other,
@@ -1664,20 +1594,12 @@ function commitWork(current: Fiber | null, finishedWork: Fiber): void {
       ) {
         try {
           startLayoutEffectTimer();
-          commitHookEffectListUnmount(
-            HookLayout | HookHasEffect,
-            finishedWork,
-            finishedWork.return,
-          );
+          commitHookEffectListUnmount(HookLayout | HookHasEffect, finishedWork);
         } finally {
           recordLayoutEffectDuration(finishedWork);
         }
       } else {
-        commitHookEffectListUnmount(
-          HookLayout | HookHasEffect,
-          finishedWork,
-          finishedWork.return,
-        );
+        commitHookEffectListUnmount(HookLayout | HookHasEffect, finishedWork);
       }
       return;
     }
@@ -1894,54 +1816,270 @@ export function isSuspenseBoundaryBeingHidden(
   return false;
 }
 
-function commitResetTextContent(current: Fiber): void {
+function commitResetTextContent(current: Fiber) {
   if (!supportsMutation) {
     return;
   }
   resetTextContent(current.stateNode);
 }
 
-function commitPassiveWork(finishedWork: Fiber): void {
+export function commitPassiveMountEffects(
+  root: FiberRoot,
+  firstChild: Fiber,
+): void {
+  nextEffect = firstChild;
+  commitPassiveMountEffects_begin(firstChild, root);
+}
+
+function commitPassiveMountEffects_begin(subtreeRoot: Fiber, root: FiberRoot) {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    const firstChild = fiber.child;
+    if ((fiber.subtreeFlags & PassiveMask) !== NoFlags && firstChild !== null) {
+      ensureCorrectReturnPointer(firstChild, fiber);
+      nextEffect = firstChild;
+    } else {
+      commitPassiveMountEffects_complete(subtreeRoot, root);
+    }
+  }
+}
+
+function commitPassiveMountEffects_complete(
+  subtreeRoot: Fiber,
+  root: FiberRoot,
+) {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    if ((fiber.flags & Passive) !== NoFlags) {
+      if (__DEV__) {
+        setCurrentDebugFiberInDEV(fiber);
+        invokeGuardedCallback(
+          null,
+          commitPassiveMountOnFiber,
+          null,
+          root,
+          fiber,
+        );
+        if (hasCaughtError()) {
+          const error = clearCaughtError();
+          captureCommitPhaseError(fiber, error);
+        }
+        resetCurrentDebugFiberInDEV();
+      } else {
+        try {
+          commitPassiveMountOnFiber(root, fiber);
+        } catch (error) {
+          captureCommitPhaseError(fiber, error);
+        }
+      }
+    }
+
+    if (fiber === subtreeRoot) {
+      nextEffect = null;
+      return;
+    }
+
+    const sibling = fiber.sibling;
+    if (sibling !== null) {
+      ensureCorrectReturnPointer(sibling, fiber.return);
+      nextEffect = sibling;
+      return;
+    }
+
+    nextEffect = fiber.return;
+  }
+}
+
+function commitPassiveMountOnFiber(
+  finishedRoot: FiberRoot,
+  finishedWork: Fiber,
+): void {
   switch (finishedWork.tag) {
     case FunctionComponent:
     case ForwardRef:
-    case SimpleMemoComponent:
-    case Block: {
-      commitHookEffectListUnmount2(
-        HookPassive | HookHasEffect,
-        finishedWork,
-        finishedWork.return,
+    case SimpleMemoComponent: {
+      if (
+        enableProfilerTimer &&
+        enableProfilerCommitHooks &&
+        finishedWork.mode & ProfileMode
+      ) {
+        startPassiveEffectTimer();
+        try {
+          commitHookEffectListMount(HookPassive | HookHasEffect, finishedWork);
+        } finally {
+          recordPassiveEffectDuration(finishedWork);
+        }
+      } else {
+        commitHookEffectListMount(HookPassive | HookHasEffect, finishedWork);
+      }
+      break;
+    }
+  }
+}
+
+export function commitPassiveUnmountEffects(firstChild: Fiber): void {
+  nextEffect = firstChild;
+  commitPassiveUnmountEffects_begin();
+}
+
+function commitPassiveUnmountEffects_begin() {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    const child = fiber.child;
+
+    if ((nextEffect.flags & ChildDeletion) !== NoFlags) {
+      const deletions = fiber.deletions;
+      if (deletions !== null) {
+        for (let i = 0; i < deletions.length; i++) {
+          const fiberToDelete = deletions[i];
+          nextEffect = fiberToDelete;
+          commitPassiveUnmountEffectsInsideOfDeletedTree_begin(fiberToDelete);
+
+          // Now that passive effects have been processed, it's safe to detach lingering pointers.
+          detachFiberAfterEffects(fiberToDelete);
+        }
+        nextEffect = fiber;
+      }
+    }
+
+    if ((fiber.subtreeFlags & PassiveMask) !== NoFlags && child !== null) {
+      ensureCorrectReturnPointer(child, fiber);
+      nextEffect = child;
+    } else {
+      commitPassiveUnmountEffects_complete();
+    }
+  }
+}
+
+function commitPassiveUnmountEffects_complete() {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    if ((fiber.flags & Passive) !== NoFlags) {
+      setCurrentDebugFiberInDEV(fiber);
+      commitPassiveUnmountOnFiber(fiber);
+      resetCurrentDebugFiberInDEV();
+    }
+
+    const sibling = fiber.sibling;
+    if (sibling !== null) {
+      ensureCorrectReturnPointer(sibling, fiber.return);
+      nextEffect = sibling;
+      return;
+    }
+
+    nextEffect = fiber.return;
+  }
+}
+
+function commitPassiveUnmountOnFiber(finishedWork: Fiber): void {
+  if (__DEV__) {
+    finishedWork.flags &= ~PassiveUnmountPendingDev;
+    const alternate = finishedWork.alternate;
+    if (alternate !== null) {
+      alternate.flags &= ~PassiveUnmountPendingDev;
+    }
+  }
+
+  switch (finishedWork.tag) {
+    case FunctionComponent:
+    case ForwardRef:
+    case SimpleMemoComponent: {
+      if (
+        enableProfilerTimer &&
+        enableProfilerCommitHooks &&
+        finishedWork.mode & ProfileMode
+      ) {
+        startPassiveEffectTimer();
+        commitHookEffectListUnmount(HookPassive | HookHasEffect, finishedWork);
+        recordPassiveEffectDuration(finishedWork);
+      } else {
+        commitHookEffectListUnmount(HookPassive | HookHasEffect, finishedWork);
+      }
+      break;
+    }
+  }
+}
+
+function commitPassiveUnmountEffectsInsideOfDeletedTree_begin(
+  deletedSubtreeRoot: Fiber,
+) {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    const child = fiber.child;
+    // TODO: Only traverse subtree if it has a PassiveStatic flag
+    if (child !== null) {
+      ensureCorrectReturnPointer(child, fiber);
+      nextEffect = child;
+    } else {
+      commitPassiveUnmountEffectsInsideOfDeletedTree_complete(
+        deletedSubtreeRoot,
       );
     }
   }
 }
 
-function commitPassiveUnmount(
-  current: Fiber,
-  nearestMountedAncestor: Fiber | null,
-): void {
+function commitPassiveUnmountEffectsInsideOfDeletedTree_complete(
+  deletedSubtreeRoot: Fiber,
+) {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    // TODO: Check if fiber has a PassiveStatic flag
+    setCurrentDebugFiberInDEV(fiber);
+    commitPassiveUnmountInsideDeletedTreeOnFiber(fiber);
+    resetCurrentDebugFiberInDEV();
+
+    if (fiber === deletedSubtreeRoot) {
+      nextEffect = null;
+      return;
+    }
+
+    const sibling = fiber.sibling;
+    if (sibling !== null) {
+      ensureCorrectReturnPointer(sibling, fiber.return);
+      nextEffect = sibling;
+      return;
+    }
+
+    nextEffect = fiber.return;
+  }
+}
+
+function commitPassiveUnmountInsideDeletedTreeOnFiber(current: Fiber): void {
   switch (current.tag) {
     case FunctionComponent:
     case ForwardRef:
-    case SimpleMemoComponent:
-    case Block:
-      commitHookEffectListUnmount2(
-        HookPassive,
-        current,
-        nearestMountedAncestor,
-      );
+    case SimpleMemoComponent: {
+      if (
+        enableProfilerTimer &&
+        enableProfilerCommitHooks &&
+        current.mode & ProfileMode
+      ) {
+        startPassiveEffectTimer();
+        commitHookEffectListUnmount(HookPassive, current);
+        recordPassiveEffectDuration(current);
+      } else {
+        commitHookEffectListUnmount(HookPassive, current);
+      }
+      break;
+    }
   }
 }
 
-function commitPassiveLifeCycles(finishedWork: Fiber): void {
-  switch (finishedWork.tag) {
-    case FunctionComponent:
-    case ForwardRef:
-    case SimpleMemoComponent:
-    case Block: {
-      commitHookEffectListMount2(finishedWork);
+let didWarnWrongReturnPointer = false;
+function ensureCorrectReturnPointer(fiber, expectedReturnFiber) {
+  if (__DEV__) {
+    if (!didWarnWrongReturnPointer && fiber.return !== expectedReturnFiber) {
+      didWarnWrongReturnPointer = true;
+      console.error(
+        'Internal React error: Return pointer is inconsistent ' +
+          'with parent.',
+      );
     }
   }
+
+  // TODO: Remove this assignment once we're confident that it won't break
+  // anything, by checking the warning logs for the above invariant
+  fiber.return = expectedReturnFiber;
 }
 
 export {
@@ -1953,7 +2091,4 @@ export {
   commitLifeCycles,
   commitAttachRef,
   commitDetachRef,
-  commitPassiveUnmount,
-  commitPassiveWork,
-  commitPassiveLifeCycles,
 };

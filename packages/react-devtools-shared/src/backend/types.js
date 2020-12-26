@@ -26,7 +26,6 @@ export type WorkFlags = number;
 export type ExpirationTime = number;
 
 export type WorkTagMap = {|
-  Block: WorkTag,
   ClassComponent: WorkTag,
   ContextConsumer: WorkTag,
   ContextProvider: WorkTag,
@@ -43,10 +42,12 @@ export type WorkTagMap = {|
   IncompleteClassComponent: WorkTag,
   IndeterminateComponent: WorkTag,
   LazyComponent: WorkTag,
+  LegacyHiddenComponent: WorkTag,
   MemoComponent: WorkTag,
   Mode: WorkTag,
   OffscreenComponent: WorkTag,
   Profiler: WorkTag,
+  ScopeComponent: WorkTag,
   SimpleMemoComponent: WorkTag,
   SuspenseComponent: WorkTag,
   SuspenseListComponent: WorkTag,
@@ -97,11 +98,35 @@ export type ReactRenderer = {
     path: Array<string | number>,
     value: any,
   ) => void,
+  // 17+
+  overrideHookStateDeletePath?: ?(
+    fiber: Object,
+    id: number,
+    path: Array<string | number>,
+  ) => void,
+  // 17+
+  overrideHookStateRenamePath?: ?(
+    fiber: Object,
+    id: number,
+    oldPath: Array<string | number>,
+    newPath: Array<string | number>,
+  ) => void,
   // 16.7+
   overrideProps?: ?(
     fiber: Object,
     path: Array<string | number>,
     value: any,
+  ) => void,
+  // 17+
+  overridePropsDeletePath?: ?(
+    fiber: Object,
+    path: Array<string | number>,
+  ) => void,
+  // 17+
+  overridePropsRenamePath?: ?(
+    fiber: Object,
+    oldPath: Array<string | number>,
+    newPath: Array<string | number>,
   ) => void,
   // 16.9+
   scheduleUpdate?: ?(fiber: Object) => void,
@@ -184,11 +209,15 @@ export type InspectedElement = {|
 
   displayName: string | null,
 
-  // Does the current renderer support editable hooks?
+  // Does the current renderer support editable hooks and function props?
   canEditHooks: boolean,
-
-  // Does the current renderer support editable function props?
   canEditFunctionProps: boolean,
+
+  // Does the current renderer support advanced editing interface?
+  canEditHooksAndDeletePaths: boolean,
+  canEditHooksAndRenamePaths: boolean,
+  canEditFunctionPropsDeletePaths: boolean,
+  canEditFunctionPropsRenamePaths: boolean,
 
   // Is this Suspense, and can its value be overridden now?
   canToggleSuspense: boolean,
@@ -205,6 +234,8 @@ export type InspectedElement = {|
   props: Object | null,
   state: Object | null,
   key: number | string | null,
+  errors: Array<[string, number]>,
+  warnings: Array<[string, number]>,
 
   // List of owners
   owners: Array<Owner> | null,
@@ -261,9 +292,20 @@ export type InstanceAndStyle = {|
   style: Object | null,
 |};
 
+type Type = 'props' | 'hooks' | 'state' | 'context';
+
 export type RendererInterface = {
   cleanup: () => void,
+  clearErrorsAndWarnings: () => void,
+  clearErrorsForFiberID: (id: number) => void,
+  clearWarningsForFiberID: (id: number) => void,
   copyElementPath: (id: number, path: Array<string | number>) => void,
+  deletePath: (
+    type: Type,
+    id: number,
+    hookID: ?number,
+    path: Array<string | number>,
+  ) => void,
   findNativeNodesForFiberID: FindNativeNodesForFiberID,
   flushInitialOperations: () => void,
   getBestMatchForTrackedPath: () => PathMatch | null,
@@ -281,21 +323,26 @@ export type RendererInterface = {
   ) => InspectedElementPayload,
   logElementToConsole: (id: number) => void,
   overrideSuspense: (id: number, forceFallback: boolean) => void,
+  overrideValueAtPath: (
+    type: Type,
+    id: number,
+    hook: ?number,
+    path: Array<string | number>,
+    value: any,
+  ) => void,
   prepareViewAttributeSource: (
     id: number,
     path: Array<string | number>,
   ) => void,
   prepareViewElementSource: (id: number) => void,
-  renderer: ReactRenderer | null,
-  setInContext: (id: number, path: Array<string | number>, value: any) => void,
-  setInHook: (
+  renamePath: (
+    type: Type,
     id: number,
-    index: number,
-    path: Array<string | number>,
-    value: any,
+    hookID: ?number,
+    oldPath: Array<string | number>,
+    newPath: Array<string | number>,
   ) => void,
-  setInProps: (id: number, path: Array<string | number>, value: any) => void,
-  setInState: (id: number, path: Array<string | number>, value: any) => void,
+  renderer: ReactRenderer | null,
   setTraceUpdatesEnabled: (enabled: boolean) => void,
   setTrackedPath: (path: Array<PathFrame> | null) => void,
   startProfiling: (recordChangeDescriptions: boolean) => void,

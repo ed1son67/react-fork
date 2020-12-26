@@ -79,7 +79,7 @@ describe('ReactDOMServerPartialHydration', () => {
 
     React = require('react');
     ReactDOM = require('react-dom');
-    act = require('react-dom/test-utils').act;
+    act = require('react-dom/test-utils').unstable_concurrentAct;
     ReactDOMServer = require('react-dom/server');
     Scheduler = require('scheduler');
     Suspense = React.Suspense;
@@ -87,7 +87,7 @@ describe('ReactDOMServerPartialHydration', () => {
   });
 
   // Note: This is based on a similar component we use in www. We can delete
-  // once the extra div wrapper is no longer neccessary.
+  // once the extra div wrapper is no longer necessary.
   function LegacyHiddenDiv({children, mode}) {
     return (
       <div hidden={mode === 'hidden'}>
@@ -367,7 +367,7 @@ describe('ReactDOMServerPartialHydration', () => {
     // This is a new node.
     expect(span).not.toBe(span2);
 
-    if (gate(flags => flags.new)) {
+    if (gate(flags => flags.dfsEffectsRefactor)) {
       // The effects list refactor causes this to be null because the Suspense Offscreen's child
       // is null. However, since we can't hydrate Suspense in legacy this change in behavior is ok
       expect(ref.current).toBe(null);
